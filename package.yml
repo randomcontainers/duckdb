@@ -1,0 +1,118 @@
+name: duckdb
+title: DuckDB
+summary: Analytical SQL database in a single binary, with a shell that queries CSV, Parquet and JSON files in place.
+homepage: https://duckdb.org/
+# DuckDB is MIT. The release binary also has the libraries in third_party/
+# compiled in, under their own terms: Apache-2.0 (Parquet format, Thrift,
+# FastPFor, t-digest, Mbed TLS), BSD-2-Clause (jemalloc, LZ4, linenoise,
+# concurrentqueue), BSD-3-Clause (RE2, Snappy, Zstandard, libpg_query and the
+# HyperLogLog code from Redis), BSL-1.0 (ska_sort), Zlib (pdqsort and the
+# semaphore in concurrentqueue), PostgreSQL (the SQL parser), Unicode-DFS-2016
+# and ICU (ICU), and Unicode-DFS-2015 (the Unicode data in utf8proc). Mbed TLS
+# and Zstandard are also offered under the GPL; their permissive terms apply.
+license: MIT AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND Zlib AND PostgreSQL AND Unicode-DFS-2016 AND ICU AND Unicode-DFS-2015
+upstream:
+  source: github-release
+  repository: duckdb/duckdb
+  # Releases are tagged v1.5.6. Bugfix releases of the older LTS series, such
+  # as v1.4.5, sort below the current version and are skipped. Only 1.x is
+  # matched: 2.0 needs changes to the license files, tests and license label.
+  tag-pattern: '^v(1\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.5.6
+  # The images ship upstream's prebuilt CLI. The tag is cloned only for the
+  # license files of DuckDB and the libraries compiled into it.
+  git:
+    url: https://github.com/duckdb/duckdb.git
+    tag: v{version}
+    commit: 069cc9f9b5be802405797faecc284961b07c70ef
+  # The CLI for glibc (Ubuntu) and for musl (Alpine), one binary per
+  # architecture. Each is pinned to the SHA-256 that GitHub records for the
+  # release asset.
+  extra-artifacts:
+    cli-amd64:
+      url: https://github.com/duckdb/duckdb/releases/download/v{version}/duckdb_cli-linux-amd64.gz
+      sha256: cce2687a38681db644c248198b99ecd86170ff47e324c5f33e50c0042f142839
+      distros: [ubuntu]
+    cli-arm64:
+      url: https://github.com/duckdb/duckdb/releases/download/v{version}/duckdb_cli-linux-arm64.gz
+      sha256: 1af0541e649a3ae34eb20eec2ca564308bf0e8993e5d6dba6be77bfb289a2718
+      distros: [ubuntu]
+    cli-amd64-musl:
+      url: https://github.com/duckdb/duckdb/releases/download/v{version}/duckdb_cli-linux-amd64-musl.gz
+      sha256: b146bc46094e67f713e0a83a0309910dfbc6696a557e651f484f2d2f80e54f6b
+      distros: [alpine]
+    cli-arm64-musl:
+      url: https://github.com/duckdb/duckdb/releases/download/v{version}/duckdb_cli-linux-arm64-musl.gz
+      sha256: 693c977b4a6b97cb5dbb445fb68750bb1e931e4a2b5887d75c2147265e8ce063
+      distros: [alpine]
+image:
+  # No CMD: without arguments DuckDB opens the shell on an in-memory database
+  # when stdin is a terminal, and runs the SQL on stdin otherwise.
+  entrypoint: [duckdb]
+  # DuckDB keeps installed extensions and persistent secrets in ~/.duckdb and
+  # the shell history in ~/.duckdb_history, and reads ~/.duckdbrc at startup.
+  # /cache is writable for any user.
+  env:
+    HOME: /cache
+test:
+  - |
+    duckdb -csv -noheader -c 'SELECT library_version FROM pragma_version()' > version.txt
+    test "$(cat version.txt)" = "v$VERSION" || { echo "expected v$VERSION, got: $(cat version.txt)" >&2; exit 1; }
+    case "$(uname -m)" in
+      x86_64) arch=amd64 ;;
+      aarch64) arch=arm64 ;;
+      *) echo "unexpected machine: $(uname -m)" >&2; exit 1 ;;
+    esac
+    # Alpine gets upstream's musl build, Ubuntu the glibc build.
+    want="linux_$arch"
+    if [ -e "/lib/ld-musl-$(uname -m).so.1" ]; then want="${want}_musl"; fi
+    duckdb -csv -noheader -c 'PRAGMA platform' > platform.txt
+    test "$(cat platform.txt)" = "$want" || { echo "expected platform $want, got: $(cat platform.txt)" >&2; exit 1; }
+    test "$HOME" = /cache || { echo "expected HOME=/cache, got: $HOME" >&2; exit 1; }
+  - |
+    # Parquet, JSON and ICU are compiled in, so they work with extension
+    # downloads and autoloading turned off.
+    duckdb -csv -noheader -c "SET autoinstall_known_extensions = false; SET autoload_known_extensions = false;
+      SELECT extension_name FROM duckdb_extensions() WHERE loaded ORDER BY 1" > loaded.txt
+    for e in icu json parquet; do
+      grep -qx "$e" loaded.txt || { echo "extension $e is not loaded" >&2; cat loaded.txt >&2; exit 1; }
+    done
+  - |
+    # q SQL [DATABASE]: run SQL without extension downloads or autoloading.
+    q() {
+      sql="$1"
+      shift
+      duckdb -csv -noheader -c "SET autoinstall_known_extensions = false; SET autoload_known_extensions = false; $sql" "$@"
+    }
+    printf 'id,name\n1,a\n2,b\n' > in.csv
+    q "COPY (SELECT * FROM read_csv('in.csv')) TO 'out.parquet' (FORMAT parquet)"
+    test "$(head -c 4 out.parquet)" = PAR1 || { echo "out.parquet is not a Parquet file" >&2; exit 1; }
+    got="$(q "SELECT concat(max(id), ':', max(name)) FROM read_parquet('out.parquet')")"
+    test "$got" = 2:b || { echo "expected 2:b from Parquet, got: $got" >&2; exit 1; }
+
+    printf '{"a": 1}\n{"a": 2}\n' > in.json
+    got="$(q "SELECT sum(a) FROM read_json('in.json')")"
+    test "$got" = 3 || { echo "expected 3 from JSON, got: $got" >&2; exit 1; }
+
+    got="$(q "SELECT hour(timezone('Asia/Tokyo', TIMESTAMPTZ '2026-01-01 12:00:00+00'))")"
+    test "$got" = 21 || { echo "expected hour 21 in Asia/Tokyo, got: $got" >&2; exit 1; }
+
+    # A database file written by one run is read back by the next.
+    q 'CREATE TABLE t AS SELECT range AS i FROM range(1000)' test.duckdb
+    got="$(q 'SELECT sum(i) FROM t' test.duckdb)"
+    test "$got" = 499500 || { echo "expected 499500 from test.duckdb, got: $got" >&2; exit 1; }
+
+    # SQL on stdin runs as a script.
+    got="$(printf 'SELECT 40 + 2;\n' | duckdb -csv -noheader)"
+    test "$got" = 42 || { echo "expected 42 from stdin, got: $got" >&2; exit 1; }
+examples:
+  - title: Query a CSV file in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/duckdb -c "SELECT * FROM 'sales.csv' LIMIT 10"
+  - title: Convert a CSV file to Parquet
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/duckdb -c "COPY (FROM 'sales.csv') TO 'sales.parquet' (FORMAT parquet)"
+  - title: Open the interactive shell on a database file
+    command: docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/duckdb analytics.duckdb
+  - title: Run a SQL script against a database file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/duckdb -f report.sql analytics.duckdb
