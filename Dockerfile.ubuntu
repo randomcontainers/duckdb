@@ -1,0 +1,147 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      git; \
+    rm -rf /var/lib/apt/lists/*
+
+# DuckDB publishes its CLI for glibc as one gzip-compressed binary per
+# architecture. ADD checks each file against the SHA-256 pinned in package.yml
+# and leaves a remote .gz packed; the next step unpacks the one for
+# TARGETARCH.
+ARG VERSION
+ARG CLI_AMD64_SHA256
+ARG CLI_ARM64_SHA256
+ADD --checksum=sha256:${CLI_AMD64_SHA256} https://github.com/duckdb/duckdb/releases/download/v${VERSION}/duckdb_cli-linux-amd64.gz /tmp/dl/
+ADD --checksum=sha256:${CLI_ARM64_SHA256} https://github.com/duckdb/duckdb/releases/download/v${VERSION}/duckdb_cli-linux-arm64.gz /tmp/dl/
+
+# The binary is installed as published. It must report this version, the
+# commit of the release tag and the platform of the glibc build.
+ARG SOURCE_COMMIT
+ARG TARGETARCH
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    case "${TARGETARCH}" in \
+      amd64) sha256="${CLI_AMD64_SHA256}" ;; \
+      arm64) sha256="${CLI_ARM64_SHA256}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    asset="duckdb_cli-linux-${TARGETARCH}.gz"; \
+    install -d /out/usr/local/bin; \
+    gzip -dc "/tmp/dl/${asset}" > /out/usr/local/bin/duckdb; \
+    chmod 755 /out/usr/local/bin/duckdb; \
+    duckdb=/out/usr/local/bin/duckdb; \
+    "$duckdb" -csv -noheader -c 'SELECT library_version, source_id FROM pragma_version()' > /tmp/duckdb-version; \
+    IFS=, read -r library_version source_id < /tmp/duckdb-version; \
+    test "${library_version}" = "v${VERSION}" \
+      || { echo "expected v${VERSION}, got: $(cat /tmp/duckdb-version)" >&2; exit 1; }; \
+    printf '%s\n' "${source_id}" | grep -Eqx '[0-9a-f]{7,40}' \
+      || { echo "unexpected source_id: ${source_id}" >&2; exit 1; }; \
+    case "${SOURCE_COMMIT}" in \
+      "${source_id}"*) ;; \
+      *) echo "the binary was built from ${source_id}, not from ${SOURCE_COMMIT}" >&2; exit 1 ;; \
+    esac; \
+    platform="$("$duckdb" -csv -noheader -c 'PRAGMA platform')"; \
+    test "${platform}" = "linux_${TARGETARCH}" \
+      || { echo "expected platform linux_${TARGETARCH}, got: ${platform}" >&2; exit 1; }; \
+    echo "https://github.com/duckdb/duckdb/releases/download/v${VERSION}/${asset}" > /tmp/binary-url; \
+    { \
+      echo "binary: ${asset}"; \
+      echo "binary-sha256: ${sha256}"; \
+      echo "duckdb-sha256: $(sha256sum "$duckdb" | cut -d ' ' -f 1)"; \
+      echo "version: ${library_version} ${source_id}"; \
+      echo "platform: ${platform}"; \
+    } > /tmp/buildinfo
+
+ARG BASE_IMAGE
+# The release tag is cloned without file contents and only the license files
+# are checked out; the tag must point to the commit pinned in package.yml.
+# DuckDB's LICENSE and the license files under third_party/,
+# extension/*/third_party/, src/ and tools/shell/ are copied, keeping their
+# paths. Snowball is left out: it is in third_party/ but not in the CLI. The
+# HyperLogLog code from Redis keeps its BSD-3-Clause notice in the first
+# comment of each file. The SQL parser is derived from PostgreSQL, whose
+# license text the source tree lacks; licenses/ holds it. runtime-deps lists
+# the packages that own the libraries duckdb loads, minus the base image's
+# packages, plus the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --filter=blob:none --sparse \
+      --branch "v${VERSION}" https://github.com/duckdb/duckdb.git /src/duckdb; \
+    test "$(git -C /src/duckdb rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    git -C /src/duckdb sparse-checkout set --no-cone \
+      '/LICENSE' \
+      '/third_party/**/LICENSE*' \
+      '/third_party/**/NOTICE*' \
+      '/third_party/**/COPYING*' \
+      '/extension/*/third_party/**/LICENSE*' \
+      '/src/**/LICENSE*' \
+      '/tools/shell/**/LICENSE*' \
+      '/third_party/hyperloglog/hyperloglog.cpp' \
+      '/third_party/hyperloglog/sds.cpp' \
+      '!/third_party/snowball/**'; \
+    meta=/out/usr/local/share/randomcontainers/duckdb; \
+    find /src/duckdb -path /src/duckdb/.git -prune -o -type f \
+      \( -name 'LICENSE*' -o -name 'NOTICE*' -o -name 'COPYING*' \) -print \
+      | LC_ALL=C sort > /tmp/license-files; \
+    while read -r f; do \
+      install -D -m 644 "$f" "$meta/licenses/${f#/src/duckdb/}"; \
+    done < /tmp/license-files; \
+    for f in LICENSE extension/icu/third_party/icu/LICENSE third_party/jemalloc/LICENSE \
+      third_party/libpg_query/LICENSE third_party/mbedtls/LICENSE third_party/pdqsort/LICENSE \
+      third_party/ska_sort/LICENSE third_party/utf8proc/LICENSE tools/shell/linenoise/LICENSE; do \
+      test -s "$meta/licenses/$f" || { echo "missing license file: $f" >&2; exit 1; }; \
+    done; \
+    for f in hyperloglog sds; do \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) { printf "%s", b; exit } }' \
+        "/src/duckdb/third_party/hyperloglog/$f.cpp" > "$meta/licenses/third_party/hyperloglog/COPYING.$f"; \
+      grep -q 'Redistribution and use' "$meta/licenses/third_party/hyperloglog/COPYING.$f"; \
+    done; \
+    install -m 644 /tmp/licenses.extra/PostgreSQL "$meta/licenses/PostgreSQL"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/duckdb/duckdb.git@${SOURCE_COMMIT}" \
+      "$(cat /tmp/binary-url)" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      cat /tmp/buildinfo; \
+    } > "$meta/buildinfo"; \
+    ldd /out/usr/local/bin/duckdb > /tmp/ldd; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    grep -q '/libstdc++\.so\.6' /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/duckdb/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "duckdb"]
